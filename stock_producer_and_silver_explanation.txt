@@ -1,0 +1,242 @@
+WHAT DO stock_producer.py AND stock_silver.py DO?
+====================================================
+
+OVERVIEW
+--------
+
+These two Python files work together to collect Indian stock prices, send
+them through Apache Kafka, validate the incoming messages, and store the
+results in Delta Lake.
+
+The overall data flow is:
+
+Stock APIs
+    |
+    v
+stock_producer.py
+    |
+    v
+Apache Kafka topic: stock-prices
+    |
+    v
+stock_silver.py
+    |
+    +--------------------------+
+    |                          |
+    v                          v
+Silver Delta table       Quarantine Delta table
+(valid records)          (invalid records)
+
+
+1. stock_producer.py — STOCK DATA COLLECTION AND KAFKA PUBLISHING
+-----------------------------------------------------------------
+
+Purpose:
+    Fetch stock-price information for the configured 13 Indian companies
+    and publish the latest observations to the Kafka topic stock-prices.
+
+What it does:
+
+1. Defines a stock master containing 13 Indian stocks and their Yahoo
+   Finance symbols.
+
+2. Connects to external stock-data sources using HTTP requests.
+
+3. Attempts to fetch each stock's data in this order:
+       Primary source: IndianAPI
+       Fallback 1: Yahoo Finance
+       Fallback 2: Economic Times
+
+4. If one source fails for a stock, it logs the error and tries the next
+   configured source.
+
+5. Extracts information such as:
+       - Stock symbol
+       - Yahoo Finance symbol
+       - Current price
+       - Price change
+       - Percentage change
+       - Currency
+       - Data source
+       - Source timestamp
+       - Fetch timestamp, when supplied by the source function
+
+6. Stores the latest successfully fetched observation for each stock in
+   an in-memory cache shared between its threads.
+
+7. Runs two main threads:
+       - Stock fetcher: refreshes stock prices approximately every
+         10 seconds.
+       - Kafka publisher: publishes the latest cached observations
+         every 100 milliseconds.
+
+8. Waits until all 13 stocks have been fetched at least once before
+   publishing the cached stock observations.
+
+9. Adds ingested_at to each message before publishing. This represents
+   the producer's publication time.
+
+10. Sends the JSON messages to the Kafka topic:
+        stock-prices
+    on the Kafka broker:
+        localhost:9092
+
+11. Flushes and closes the producer and HTTP sessions when stopped with
+    CTRL + C.
+
+Important:
+    The 100-millisecond publishing interval means the producer repeatedly
+    publishes the latest cached observations. It does not fetch fresh
+    market prices every 100 milliseconds. The stock-fetching cycle is
+    approximately every 10 seconds.
+
+
+2. stock_silver.py — KAFKA STREAM PROCESSING AND SILVER STORAGE
+---------------------------------------------------------------
+
+Purpose:
+    Continuously consume stock messages from Kafka, parse and validate
+    them, and store valid and invalid records separately as Delta tables.
+
+What it does:
+
+1. Configures the Windows Hadoop environment when winutils.exe is
+   available at C:\hadoop\bin\winutils.exe.
+
+2. Creates a Spark session configured for:
+       - PySpark Structured Streaming
+       - Apache Kafka integration
+       - Delta Lake
+       - UTC session time zone
+
+3. Connects to the Kafka broker:
+       localhost:9092
+
+4. Subscribes to the Kafka topic:
+       stock-prices
+
+5. Reads the Kafka message value and metadata, including:
+       - Topic
+       - Partition
+       - Offset
+       - Kafka timestamp
+       - Kafka key
+       - Original JSON message
+
+6. Parses each JSON message using the defined stock schema.
+
+7. Creates a unique tick_id using the Kafka topic, partition, and
+   offset. This identifies each Kafka publication.
+
+8. Converts the producer timestamps into Spark timestamps:
+       - timestamp -> market_timestamp
+       - fetched_at -> fetched_timestamp
+       - ingested_at -> publication_timestamp
+
+9. Validates incoming records. The current validation checks include:
+       - Stock symbol is present.
+       - Stock symbol belongs to the configured 13-stock list.
+       - Yahoo Finance symbol is present.
+       - Current price is present and greater than zero.
+       - Currency is present.
+       - Data source is present.
+       - Market, fetch, and publication timestamps are valid.
+
+10. Separates records into two groups:
+
+       VALID RECORDS
+       Records that pass the validation rules are written to:
+           silver/data/stock_silver
+
+       INVALID RECORDS
+       Records that fail validation are written to:
+           silver/data/stock_quarantine
+       The quarantine records include rejection_reason to explain why
+       a record failed validation.
+
+11. Writes the records in Delta format using append mode.
+
+12. Uses transaction application IDs and batch versions for
+    idempotent micro-batch writes.
+
+13. Uses a streaming checkpoint at:
+        silver/checkpoints/stock_silver
+    to retain streaming progress and support recovery.
+
+14. Runs continuously until stopped with CTRL + C.
+
+
+3. HOW THE TWO FILES WORK TOGETHER
+----------------------------------
+
+STEP 1:
+    stock_producer.py fetches stock-price data from the configured
+    external sources.
+
+STEP 2:
+    The producer keeps the latest successfully fetched observation
+    for each stock in memory.
+
+STEP 3:
+    The producer publishes the latest observations as JSON messages
+    to Kafka topic stock-prices.
+
+STEP 4:
+    stock_silver.py continuously reads messages from that Kafka topic
+    using Spark Structured Streaming.
+
+STEP 5:
+    Spark parses the JSON and applies the Silver validation rules.
+
+STEP 6:
+    Valid messages are appended to the Silver Delta table.
+
+STEP 7:
+    Invalid messages are appended to the Quarantine Delta table
+    with their rejection reasons.
+
+
+4. OUTPUTS
+----------
+
+Silver Delta table:
+    silver/data/stock_silver
+
+    Contains stock records that pass the current validation rules.
+
+Quarantine Delta table:
+    silver/data/stock_quarantine
+
+    Contains records that fail validation, along with rejection reasons.
+
+Streaming checkpoint:
+    silver/checkpoints/stock_silver
+
+    Stores streaming progress and recovery information.
+
+
+5. IMPORTANT NOTES
+------------------
+
+- Kafka must be running before the producer and Silver application.
+- The producer and Silver application must use the same Kafka broker
+  and topic.
+- The producer fetches prices approximately every 10 seconds and
+  publishes cached observations every 100 milliseconds.
+- Repeated observations are separate Kafka publications. The Silver
+  code does not deduplicate them.
+- The Silver application starts reading from the configured
+  startingOffsets value when no checkpoint exists. An existing
+  checkpoint controls progress on restart.
+- Do not delete the checkpoint directory if you want to resume the
+  existing streaming progress.
+- The current IndianAPI fetch function in the supplied producer code
+  returns timestamp but does not include fetched_at. Since Silver
+  validates fetched_at, IndianAPI-sourced records may be sent to
+  Quarantine until fetched_at is added to that return message.
+- The Kafka connector is configured for Spark 4.1.4. The Python
+  environment uses PySpark 4.1.4 and delta-spark 4.3.1.
+
+
+END OF DOCUMENT
+---------------
